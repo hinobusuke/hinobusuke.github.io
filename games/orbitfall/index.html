@@ -1,0 +1,1922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORBITFALL — hold the orbit, outlive the collapse</title>
+<style>
+/* ORBITFALL page shell: a black void, the canvas centred and letterboxed. */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  background: #01020a;
+  overflow: hidden;
+}
+
+#wrap {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#stage {
+  display: block;
+  background: #050914;
+  box-shadow: 0 0 90px rgba(38, 90, 180, 0.35), 0 0 22px rgba(55, 244, 255, 0.12);
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+</style>
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAlElEQVR4nO3VuQ3AIAwFUBqK9NklVRbMCGyWPdIT0Ua244NLwsUv4T9ZwoS47XlkggOWABxPHgMoxd+sA4DKIYQJkNPZdwKl8C/NAJxyCBFrvAJJOYZQA8ii+zIjSABaikWBkAGocgThADVAVa5AzDsBB0yxB1BEr03IQrT+CzQI7p0iABchuU8MgECW82ZAjTjAAS9dippziDL2aQAAAABJRU5ErkJggg==">
+</head>
+<body>
+<main id="wrap">
+  <canvas id="stage" width="1280" height="800"></canvas>
+</main>
+<script>
+(() => {
+  // orbitfall/game/js/rng.js
+  var TAU = Math.PI * 2;
+  function mulberry32(seed2) {
+    let a = seed2 >>> 0;
+    return function next() {
+      a |= 0;
+      a = a + 1831565813 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function makeRng(seed2) {
+    const next = mulberry32(seed2);
+    return {
+      next,
+      range: (min, max) => min + next() * (max - min),
+      int: (min, max) => Math.floor(min + next() * (max - min + 1)),
+      pick: (arr) => arr[Math.floor(next() * arr.length)],
+      chance: (p) => next() < p,
+      angle: () => next() * TAU,
+      sign: () => next() < 0.5 ? -1 : 1
+    };
+  }
+  var clamp = (v, min, max) => v < min ? min : v > max ? max : v;
+
+  // orbitfall/game/js/world.js
+  var VIEW_W = 1280;
+  var VIEW_H = 800;
+  var STAR = {
+    x: VIEW_W / 2,
+    y: VIEW_H / 2,
+    surface: 76,
+    // anything crossing this radius is eaten / burned
+    core: 54
+  };
+  var GM = 235e5;
+  var SOFT2 = 150 * 150;
+  function gravityAt(x, y) {
+    const dx = STAR.x - x;
+    const dy = STAR.y - y;
+    const r2 = dx * dx + dy * dy + SOFT2;
+    const r = Math.sqrt(r2 - SOFT2) || 1;
+    const a = GM / r2;
+    return { ax: dx / (r || 1) * a, ay: dy / (r || 1) * a, r };
+  }
+  function applyGravity(e, dt, scale = 1) {
+    const g = gravityAt(e.x, e.y);
+    e.vx += g.ax * scale * dt;
+    e.vy += g.ay * scale * dt;
+    return g.r;
+  }
+  function orbitalDamp(e, dt, radialRate = 0.9, tangentialRate = 0.06) {
+    const dx = e.x - STAR.x;
+    const dy = e.y - STAR.y;
+    const r = Math.sqrt(dx * dx + dy * dy) || 1;
+    const ux = dx / r;
+    const uy = dy / r;
+    const vr = e.vx * ux + e.vy * uy;
+    const vt = e.vx * -uy + e.vy * ux;
+    const vr2 = vr * Math.max(0, 1 - radialRate * dt);
+    const vt2 = vt * Math.max(0, 1 - tangentialRate * dt);
+    e.vx = ux * vr2 + -uy * vt2;
+    e.vy = uy * vr2 + ux * vt2;
+  }
+  function distToStar(x, y) {
+    const dx = x - STAR.x;
+    const dy = y - STAR.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  var Starfield = class {
+    constructor() {
+      const rng = makeRng(20261115);
+      this.layers = [];
+      const defs = [
+        { count: 110, depth: 4, size: 1, alpha: 0.5 },
+        { count: 70, depth: 9, size: 1.6, alpha: 0.75 },
+        { count: 34, depth: 16, size: 2.4, alpha: 1 }
+      ];
+      for (const d of defs) {
+        const stars = [];
+        for (let i = 0; i < d.count; i++) {
+          stars.push({
+            x: rng.next() * VIEW_W,
+            y: rng.next() * VIEW_H,
+            tw: rng.range(1, 4),
+            // twinkle speed
+            ph: rng.range(0, TAU)
+          });
+        }
+        this.layers.push({ ...d, stars });
+      }
+      this.nebula = this.buildNebula(rng);
+    }
+    buildNebula(rng) {
+      const c = document.createElement("canvas");
+      c.width = VIEW_W;
+      c.height = VIEW_H;
+      const g = c.getContext("2d");
+      const blobs = [
+        ["rgba(38, 20, 92, 0.55)", 240, 150, 420],
+        ["rgba(10, 60, 92, 0.5)", 1060, 620, 460],
+        ["rgba(92, 16, 74, 0.42)", 1090, 130, 340],
+        ["rgba(14, 44, 84, 0.5)", 180, 660, 380],
+        ["rgba(70, 30, 10, 0.35)", 640, 400, 520]
+      ];
+      for (const [color, x, y, r] of blobs) {
+        const grad = g.createRadialGradient(x, y, 0, x, y, r);
+        grad.addColorStop(0, color);
+        grad.addColorStop(1, "rgba(0,0,0,0)");
+        g.fillStyle = grad;
+        g.fillRect(x - r, y - r, r * 2, r * 2);
+      }
+      g.fillStyle = "rgba(180,200,255,0.5)";
+      for (let i = 0; i < 160; i++) {
+        g.globalAlpha = 0.12 + rng.next() * 0.3;
+        g.fillRect(rng.next() * VIEW_W, rng.next() * VIEW_H, 1, 1);
+      }
+      g.globalAlpha = 1;
+      return c;
+    }
+    draw(ctx2, t, focusX, focusY) {
+      ctx2.fillStyle = "#050914";
+      ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+      ctx2.drawImage(this.nebula, 0, 0);
+      const ox = (focusX - STAR.x) / STAR.x;
+      const oy = (focusY - STAR.y) / STAR.y;
+      for (const layer of this.layers) {
+        ctx2.fillStyle = "#cfe8ff";
+        for (const s of layer.stars) {
+          const tw = 0.65 + 0.35 * Math.sin(t * s.tw + s.ph);
+          ctx2.globalAlpha = layer.alpha * tw;
+          const x = s.x - ox * layer.depth;
+          const y = s.y - oy * layer.depth;
+          ctx2.fillRect(x, y, layer.size, layer.size);
+        }
+      }
+      ctx2.globalAlpha = 1;
+    }
+  };
+  function drawStar(ctx2, t) {
+    const { x, y, surface, core } = STAR;
+    let glow = ctx2.createRadialGradient(x, y, core, x, y, surface * 3.4);
+    glow.addColorStop(0, "rgba(255, 166, 66, 0.30)");
+    glow.addColorStop(0.5, "rgba(255, 94, 58, 0.10)");
+    glow.addColorStop(1, "rgba(255, 94, 58, 0)");
+    ctx2.fillStyle = glow;
+    ctx2.fillRect(x - surface * 3.4, y - surface * 3.4, surface * 6.8, surface * 6.8);
+    ctx2.save();
+    ctx2.translate(x, y);
+    for (let i = 0; i < 26; i++) {
+      const a = i / 26 * TAU + t * 0.05;
+      const flicker = 0.72 + 0.28 * Math.sin(t * 2.3 + i * 1.7) * Math.sin(t * 0.9 + i);
+      const len = surface * (0.55 + 0.5 * flicker);
+      const w = 0.055 + 0.03 * Math.sin(t * 1.4 + i * 2.3);
+      ctx2.rotate(0);
+      ctx2.beginPath();
+      ctx2.moveTo(Math.cos(a - w) * surface * 0.92, Math.sin(a - w) * surface * 0.92);
+      ctx2.lineTo(Math.cos(a) * (surface + len), Math.sin(a) * (surface + len));
+      ctx2.lineTo(Math.cos(a + w) * surface * 0.92, Math.sin(a + w) * surface * 0.92);
+      ctx2.closePath();
+      ctx2.fillStyle = "rgba(255, 140, 60, 0.20)";
+      ctx2.fill();
+    }
+    ctx2.restore();
+    const body = ctx2.createRadialGradient(x, y, 0, x, y, surface);
+    body.addColorStop(0, "#fff7dd");
+    body.addColorStop(0.45, "#ffd98a");
+    body.addColorStop(0.78, "#ff9a3d");
+    body.addColorStop(0.95, "#ff5f3c");
+    body.addColorStop(1, "#e83a2a");
+    ctx2.fillStyle = body;
+    ctx2.beginPath();
+    ctx2.arc(x, y, surface, 0, TAU);
+    ctx2.fill();
+    ctx2.save();
+    ctx2.beginPath();
+    ctx2.arc(x, y, surface, 0, TAU);
+    ctx2.clip();
+    ctx2.fillStyle = "rgba(190, 60, 20, 0.18)";
+    for (let i = 0; i < 5; i++) {
+      const a = t * 0.07 * (i + 1) + i * 2.4;
+      const rr = surface * (0.25 + 0.12 * i);
+      ctx2.beginPath();
+      ctx2.arc(x + Math.cos(a) * rr * 0.6, y + Math.sin(a) * rr * 0.6, rr * 0.42, 0, TAU);
+      ctx2.fill();
+    }
+    ctx2.restore();
+    ctx2.strokeStyle = "rgba(255, 220, 150, 0.8)";
+    ctx2.lineWidth = 2;
+    ctx2.beginPath();
+    ctx2.arc(x, y, surface - 1, 0, TAU);
+    ctx2.stroke();
+  }
+  var DUST_COLORS = ["#8ef6ff", "#ffe9a3", "#ffb3f2"];
+  var DustField = class {
+    constructor() {
+      this.motes = [];
+    }
+    clear() {
+      this.motes.length = 0;
+    }
+    drop(x, y, rng, count) {
+      for (let i = 0; i < count; i++) {
+        const a = rng.next() * TAU;
+        const sp = 30 + rng.next() * 90;
+        this.motes.push({
+          x,
+          y,
+          vx: Math.cos(a) * sp,
+          vy: Math.sin(a) * sp,
+          life: 14,
+          color: rng.pick(DUST_COLORS),
+          ph: rng.range(0, TAU)
+        });
+      }
+    }
+    // Motes fall toward the star, swirl into the player's magnet field and are
+    // collected on contact. Returns how many were collected this step; motes
+    // that cross the star's surface are eaten (removed silently).
+    update(dt, player, onCollect) {
+      let collected = 0;
+      const list = this.motes;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const m = list[i];
+        m.life -= dt;
+        const r = applyGravity(m, dt, 0.55);
+        m.vx *= Math.max(0, 1 - 0.25 * dt);
+        m.vy *= Math.max(0, 1 - 0.25 * dt);
+        if (player && player.alive) {
+          const dx = player.x - m.x;
+          const dy = player.y - m.y;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < player.stats.magnet) {
+            const pull = 900 * (1 - d / player.stats.magnet) + 120;
+            m.vx += dx / (d || 1) * pull * dt;
+            m.vy += dy / (d || 1) * pull * dt;
+          }
+          if (d < 26) {
+            collected++;
+            onCollect(m);
+            list.splice(i, 1);
+            continue;
+          }
+        }
+        m.x += m.vx * dt;
+        m.y += m.vy * dt;
+        if (m.life <= 0 || r < STAR.surface - 4) list.splice(i, 1);
+      }
+      return collected;
+    }
+    draw(ctx2, t) {
+      for (const m of this.motes) {
+        const tw = 0.7 + 0.3 * Math.sin(t * 5 + m.ph);
+        const urgent = m.life < 3 ? Math.sin(t * 14 + m.ph) > 0 ? 1 : 0.25 : 1;
+        ctx2.globalAlpha = tw * urgent;
+        ctx2.fillStyle = m.color;
+        ctx2.shadowColor = m.color;
+        ctx2.shadowBlur = 10;
+        ctx2.beginPath();
+        ctx2.arc(m.x, m.y, 3, 0, TAU);
+        ctx2.fill();
+      }
+      ctx2.globalAlpha = 1;
+      ctx2.shadowBlur = 0;
+    }
+  };
+
+  // orbitfall/game/js/ship.js
+  var SHIP_RADIUS = 14;
+  var ARENA_RADIUS = 700;
+  function defaultStats() {
+    return {
+      fireInterval: 0.16,
+      // seconds between shots
+      damage: 1,
+      bulletSpeed: 640,
+      projectiles: 1,
+      // pellets per volley (Split Shot)
+      thrust: 560,
+      magnet: 95,
+      // stardust attraction radius
+      novaLevel: 0,
+      // Nova Pulse stacks
+      novaDamage: 3,
+      novaCooldown: 11,
+      armor: 0,
+      // fraction of incoming damage shrugged off
+      comboWindow: 2.6
+      // seconds to chain kills
+    };
+  }
+  var Ship = class {
+    constructor() {
+      this.radius = SHIP_RADIUS;
+      this.stats = defaultStats();
+      this.reset(340);
+    }
+    // Place the ship on a stable-ish orbit at the given radius from the star.
+    reset(orbitRadius = 340) {
+      this.stats = defaultStats();
+      this.maxHp = 100;
+      this.hp = this.maxHp;
+      const a = -Math.PI / 2;
+      this.x = STAR.x + Math.cos(a) * orbitRadius;
+      this.y = STAR.y + Math.sin(a) * orbitRadius;
+      const accel = 235e5 / (orbitRadius * orbitRadius + 150 * 150);
+      const speed = Math.sqrt(accel * orbitRadius) * 0.92;
+      this.vx = -Math.sin(a) * speed;
+      this.vy = Math.cos(a) * speed;
+      this.angle = a + Math.PI / 2;
+      this.fireTimer = 0;
+      this.novaTimer = this.stats.novaCooldown;
+      this.invuln = 0;
+      this.alive = true;
+      this.thrusting = false;
+    }
+    // input: { thrustX, thrustY } in -1..1, aimX/aimY in world coords.
+    update(dt, input) {
+      if (!this.alive) return;
+      this.invuln = Math.max(0, this.invuln - dt);
+      this.fireTimer = Math.max(0, this.fireTimer - dt);
+      this.angle = Math.atan2(input.aimY - this.y, input.aimX - this.x);
+      const tx = input.thrustX;
+      const ty = input.thrustY;
+      this.thrusting = tx !== 0 || ty !== 0;
+      if (this.thrusting) {
+        const len = Math.sqrt(tx * tx + ty * ty) || 1;
+        this.vx += tx / len * this.stats.thrust * dt;
+        this.vy += ty / len * this.stats.thrust * dt;
+      }
+      applyGravity(this, dt, 1);
+      orbitalDamp(this, dt, this.thrusting ? 0.35 : 0.8, 0.05);
+      const r = distToStar(this.x, this.y);
+      if (r > ARENA_RADIUS) {
+        const ux = (this.x - STAR.x) / r;
+        const uy = (this.y - STAR.y) / r;
+        this.vx -= ux * (r - ARENA_RADIUS) * 2.4 * dt * 60 * 0.016;
+        this.vy -= uy * (r - ARENA_RADIUS) * 2.4 * dt * 60 * 0.016;
+      }
+      const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+      const maxSpeed = 520;
+      if (speed > maxSpeed) {
+        this.vx = this.vx / speed * maxSpeed;
+        this.vy = this.vy / speed * maxSpeed;
+      }
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+      this.x = clamp(this.x, 16, 1264);
+      this.y = clamp(this.y, 16, 784);
+    }
+    canFire() {
+      return this.alive && this.fireTimer <= 0;
+    }
+    markFired() {
+      this.fireTimer = this.stats.fireInterval;
+    }
+    // Returns the damage actually taken after armor.
+    hurt(amount) {
+      if (!this.alive || this.invuln > 0) return 0;
+      const dealt = Math.max(1, Math.round(amount * (1 - this.stats.armor)));
+      this.hp -= dealt;
+      this.invuln = 0.7;
+      if (this.hp <= 0) {
+        this.hp = 0;
+        this.alive = false;
+      }
+      return dealt;
+    }
+    heal(amount) {
+      this.hp = Math.min(this.maxHp, this.hp + amount);
+    }
+    draw(ctx2, t) {
+      if (!this.alive) return;
+      const blink = this.invuln > 0 && Math.sin(t * 30) > 0;
+      ctx2.save();
+      ctx2.translate(this.x, this.y);
+      ctx2.rotate(this.angle);
+      ctx2.globalAlpha = blink ? 0.35 : 1;
+      if (this.thrusting) {
+        const fl = 12 + Math.sin(t * 42) * 4;
+        const grad = ctx2.createLinearGradient(-12, 0, -12 - fl, 0);
+        grad.addColorStop(0, "rgba(140, 240, 255, 0.9)");
+        grad.addColorStop(1, "rgba(60, 120, 255, 0)");
+        ctx2.fillStyle = grad;
+        ctx2.beginPath();
+        ctx2.moveTo(-11, -4.5);
+        ctx2.lineTo(-12 - fl, 0);
+        ctx2.lineTo(-11, 4.5);
+        ctx2.closePath();
+        ctx2.fill();
+      }
+      ctx2.beginPath();
+      ctx2.moveTo(17, 0);
+      ctx2.lineTo(-7, -7);
+      ctx2.lineTo(-13, -12);
+      ctx2.lineTo(-9, 0);
+      ctx2.lineTo(-13, 12);
+      ctx2.lineTo(-7, 7);
+      ctx2.closePath();
+      ctx2.fillStyle = "#0d2438";
+      ctx2.fill();
+      ctx2.strokeStyle = "#37f4ff";
+      ctx2.lineWidth = 2;
+      ctx2.shadowColor = "#37f4ff";
+      ctx2.shadowBlur = 10;
+      ctx2.stroke();
+      ctx2.shadowBlur = 0;
+      ctx2.fillStyle = "#bffbff";
+      ctx2.beginPath();
+      ctx2.arc(5, 0, 3.2, 0, Math.PI * 2);
+      ctx2.fill();
+      ctx2.restore();
+    }
+  };
+
+  // orbitfall/game/js/enemies.js
+  var ENEMY_TYPES = {
+    drifter: { hp: 3, radius: 15, speed: 130, score: 100, dust: 1, contact: 10, color: "#ff4d6d" },
+    mini: { hp: 1, radius: 9, speed: 185, score: 40, dust: 0, contact: 6, color: "#ff8fa8" },
+    splitter: { hp: 5, radius: 19, speed: 105, score: 180, dust: 2, contact: 12, color: "#c44dff" },
+    weaver: { hp: 4, radius: 14, speed: 150, score: 150, dust: 1, contact: 10, color: "#ffb02e" },
+    sniper: { hp: 4, radius: 15, speed: 120, score: 220, dust: 2, contact: 10, color: "#3dff8e" },
+    sentinel: { hp: 90, radius: 46, speed: 62, score: 2e3, dust: 12, contact: 25, color: "#ff3df0" }
+  };
+  var nextId = 1;
+  var Enemy = class {
+    // Spawned on the rim at angle `a`, given tangential orbital velocity so it
+    // sweeps inward like everything else in this arena.
+    constructor(type, a, rng, hpScale = 1) {
+      const cfg = ENEMY_TYPES[type];
+      this.id = nextId++;
+      this.type = type;
+      this.cfg = cfg;
+      this.maxHp = Math.round(cfg.hp * hpScale);
+      this.hp = this.maxHp;
+      this.radius = cfg.radius;
+      const rim = 665;
+      this.x = STAR.x + Math.cos(a) * rim;
+      this.y = STAR.y + Math.sin(a) * rim;
+      const dir = rng.sign();
+      const orbitSpeed = 155 + rng.next() * 55;
+      this.vx = -Math.sin(a) * orbitSpeed * dir;
+      this.vy = Math.cos(a) * orbitSpeed * dir;
+      this.seed = rng.next() * 1e3;
+      this.age = 0;
+      this.fireTimer = rng.range(1.4, 2.8);
+      this.ringTimer = 3.4;
+      this.spawnTimer = 5;
+      this.flash = 0;
+      this.dead = false;
+    }
+    // env: { player, time, shoot(x, y, angle), spawnMini(x, y, rng), rng }
+    update(dt, env) {
+      const { player } = env;
+      this.age += dt;
+      this.flash = Math.max(0, this.flash - dt);
+      applyGravity(this, dt, this.type === "sentinel" ? 0.55 : 0.7);
+      orbitalDamp(this, dt, this.type === "sentinel" ? 0.25 : 0.8, 0.04);
+      const dx = player.x - this.x;
+      const dy = player.y - this.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const ux = dx / d;
+      const uy = dy / d;
+      const s = this.cfg.speed;
+      const steer = (ax, ay, strength) => {
+        this.vx += ax * strength * dt;
+        this.vy += ay * strength * dt;
+      };
+      switch (this.type) {
+        case "drifter":
+        case "mini":
+          steer(ux, uy, s * 2.4);
+          break;
+        case "splitter":
+          steer(ux, uy, s * 1.9);
+          break;
+        case "weaver": {
+          const wob = Math.sin(this.age * 3.4 + this.seed);
+          steer(ux + -uy * wob * 0.9, uy + ux * wob * 0.9, s * 2.2);
+          break;
+        }
+        case "sniper": {
+          this.aimX = player.x;
+          this.aimY = player.y;
+          const want = d > 430 ? 1 : d < 320 ? -1 : 0;
+          const strafe = Math.sin(this.age * 0.9 + this.seed) > 0 ? 1 : -1;
+          steer(ux * want + -uy * strafe * 0.55, uy * want + ux * strafe * 0.55, s * 2.1);
+          this.fireTimer -= dt;
+          if (this.fireTimer <= 0 && player.alive && d < 560) {
+            this.fireTimer = 2.6;
+            env.shoot(this.x, this.y, Math.atan2(dy, dx));
+          }
+          break;
+        }
+        case "sentinel": {
+          steer(ux, uy, s * 1.1);
+          this.ringTimer -= dt;
+          if (this.ringTimer <= 0 && player.alive) {
+            this.ringTimer = 3.4;
+            const base = env.time * 0.7 + this.seed;
+            for (let i = 0; i < 14; i++) env.shoot(this.x, this.y, base + i / 14 * TAU);
+          }
+          this.spawnTimer -= dt;
+          if (this.spawnTimer <= 0) {
+            this.spawnTimer = 5.5;
+            env.spawnMini(this.x, this.y);
+          }
+          break;
+        }
+      }
+      const cap = this.type === "mini" ? 300 : this.type === "sentinel" ? 120 : 250;
+      const sp = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+      if (sp > cap) {
+        this.vx = this.vx / sp * cap;
+        this.vy = this.vy / sp * cap;
+      }
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+    }
+    draw(ctx2, t) {
+      const c = this.cfg.color;
+      ctx2.save();
+      ctx2.translate(this.x, this.y);
+      ctx2.shadowColor = c;
+      ctx2.shadowBlur = 12;
+      ctx2.fillStyle = this.flash > 0 ? "#ffffff" : "#160a1e";
+      ctx2.strokeStyle = c;
+      ctx2.lineWidth = 2;
+      const rot = this.age * 0.8 + this.seed;
+      switch (this.type) {
+        case "drifter": {
+          ctx2.rotate(rot);
+          ctx2.beginPath();
+          for (let i = 0; i < 3; i++) {
+            const a = i / 3 * TAU;
+            ctx2[i ? "lineTo" : "moveTo"](Math.cos(a) * this.radius, Math.sin(a) * this.radius);
+          }
+          ctx2.closePath();
+          ctx2.fill();
+          ctx2.stroke();
+          break;
+        }
+        case "mini": {
+          ctx2.rotate(-rot * 1.6);
+          ctx2.beginPath();
+          for (let i = 0; i < 4; i++) {
+            const a = i / 4 * TAU;
+            ctx2[i ? "lineTo" : "moveTo"](Math.cos(a) * this.radius, Math.sin(a) * this.radius);
+          }
+          ctx2.closePath();
+          ctx2.fill();
+          ctx2.stroke();
+          break;
+        }
+        case "splitter": {
+          ctx2.rotate(rot * 0.5);
+          ctx2.beginPath();
+          for (let i = 0; i < 6; i++) {
+            const a = i / 6 * TAU;
+            ctx2[i ? "lineTo" : "moveTo"](Math.cos(a) * this.radius, Math.sin(a) * this.radius);
+          }
+          ctx2.closePath();
+          ctx2.fill();
+          ctx2.stroke();
+          ctx2.fillStyle = ENEMY_TYPES.mini.color;
+          for (let i = 0; i < 3; i++) {
+            const a = i / 3 * TAU + rot;
+            ctx2.beginPath();
+            ctx2.arc(Math.cos(a) * 8, Math.sin(a) * 8, 3.4, 0, TAU);
+            ctx2.fill();
+          }
+          break;
+        }
+        case "weaver": {
+          ctx2.rotate(Math.sin(this.age * 3.4 + this.seed) * 0.6);
+          ctx2.beginPath();
+          ctx2.moveTo(15, 0);
+          ctx2.lineTo(-11, -10);
+          ctx2.lineTo(-5, 0);
+          ctx2.lineTo(-11, 10);
+          ctx2.closePath();
+          ctx2.fill();
+          ctx2.stroke();
+          break;
+        }
+        case "sniper": {
+          const aim = Math.atan2(this.aimY - this.y, this.aimX - this.x);
+          ctx2.rotate(aim);
+          ctx2.beginPath();
+          ctx2.arc(0, 0, this.radius - 3, 0, TAU);
+          ctx2.fill();
+          ctx2.stroke();
+          ctx2.beginPath();
+          ctx2.moveTo(6, 0);
+          ctx2.lineTo(24, 0);
+          ctx2.stroke();
+          ctx2.fillStyle = c;
+          ctx2.beginPath();
+          ctx2.arc(0, 0, 4, 0, TAU);
+          ctx2.fill();
+          break;
+        }
+        case "sentinel": {
+          ctx2.rotate(rot * 0.25);
+          ctx2.beginPath();
+          for (let i = 0; i < 8; i++) {
+            const a = i / 8 * TAU;
+            const rr = i % 2 === 0 ? this.radius : this.radius * 0.78;
+            ctx2[i ? "lineTo" : "moveTo"](Math.cos(a) * rr, Math.sin(a) * rr);
+          }
+          ctx2.closePath();
+          ctx2.fill();
+          ctx2.stroke();
+          ctx2.rotate(-rot * 0.6);
+          ctx2.strokeStyle = "#ffd7fb";
+          ctx2.beginPath();
+          ctx2.arc(0, 0, this.radius * 0.5, 0, TAU);
+          ctx2.stroke();
+          ctx2.fillStyle = this.flash > 0 ? "#ffffff" : c;
+          ctx2.beginPath();
+          ctx2.arc(0, 0, 10 + Math.sin(t * 3 + this.seed) * 2, 0, TAU);
+          ctx2.fill();
+          break;
+        }
+      }
+      ctx2.restore();
+      if (this.type !== "sentinel" && this.hp < this.maxHp && this.maxHp >= 4) {
+        ctx2.fillStyle = "rgba(255,255,255,0.75)";
+        const w = this.radius * 2 * (this.hp / this.maxHp);
+        ctx2.fillRect(this.x - this.radius, this.y + this.radius + 5, w, 2.5);
+      }
+    }
+  };
+
+  // orbitfall/game/js/projectiles.js
+  var ProjectileField = class {
+    constructor() {
+      this.bullets = [];
+      this.orbs = [];
+    }
+    clear() {
+      this.bullets.length = 0;
+      this.orbs.length = 0;
+    }
+    fireBullet(x, y, angle, speed, damage) {
+      this.bullets.push({
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        px: x,
+        py: y,
+        // previous position, for the trail stroke
+        life: 2.4,
+        damage,
+        r: 4
+      });
+    }
+    fireOrb(x, y, angle, speed, damage) {
+      this.orbs.push({
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        px: x,
+        py: y,
+        life: 6,
+        damage,
+        r: 6
+      });
+    }
+    // Moves everything one step. Anything crossing the star's surface is
+    // swallowed. Returns nothing; game.js reads the lists for collisions and
+    // removes spent rounds by flagging life = 0.
+    update(dt) {
+      for (const list of [this.bullets, this.orbs]) {
+        for (let i = list.length - 1; i >= 0; i--) {
+          const p = list[i];
+          p.life -= dt;
+          p.px = p.x;
+          p.py = p.y;
+          applyGravity(p, dt, list === this.bullets ? 0.85 : 0.5);
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          if (p.life <= 0 || distToStar(p.x, p.y) < STAR.surface - 2) {
+            list.splice(i, 1);
+          }
+        }
+      }
+    }
+    draw(ctx2) {
+      ctx2.lineCap = "round";
+      for (const b of this.bullets) {
+        ctx2.strokeStyle = "rgba(55, 244, 255, 0.35)";
+        ctx2.lineWidth = 5;
+        ctx2.beginPath();
+        ctx2.moveTo(b.px - b.vx * 0.03, b.py - b.vy * 0.03);
+        ctx2.lineTo(b.x, b.y);
+        ctx2.stroke();
+        ctx2.fillStyle = "#d8fdff";
+        ctx2.shadowColor = "#37f4ff";
+        ctx2.shadowBlur = 12;
+        ctx2.beginPath();
+        ctx2.arc(b.x, b.y, b.r - 1, 0, TAU);
+        ctx2.fill();
+      }
+      for (const o of this.orbs) {
+        ctx2.fillStyle = "#ff3df0";
+        ctx2.shadowColor = "#ff3df0";
+        ctx2.shadowBlur = 14;
+        ctx2.beginPath();
+        ctx2.arc(o.x, o.y, o.r, 0, TAU);
+        ctx2.fill();
+        ctx2.fillStyle = "#ffd7fb";
+        ctx2.beginPath();
+        ctx2.arc(o.x, o.y, o.r * 0.45, 0, TAU);
+        ctx2.fill();
+      }
+      ctx2.shadowBlur = 0;
+    }
+  };
+
+  // orbitfall/game/js/particles.js
+  var MAX_PARTICLES = 900;
+  var Particles = class {
+    constructor() {
+      this.list = [];
+    }
+    clear() {
+      this.list.length = 0;
+    }
+    spawn(x, y, vx, vy, life, size, color, drag = 0.6, gravity = 0.25, glow = true) {
+      if (this.list.length >= MAX_PARTICLES) this.list.shift();
+      this.list.push({ x, y, vx, vy, life, maxLife: life, size, color, drag, gravity, glow });
+    }
+    explosion(x, y, color, rng, count = 22, power = 260) {
+      for (let i = 0; i < count; i++) {
+        const a = rng.next() * TAU;
+        const sp = (0.25 + rng.next() * 0.75) * power;
+        this.spawn(
+          x,
+          y,
+          Math.cos(a) * sp,
+          Math.sin(a) * sp,
+          0.4 + rng.next() * 0.7,
+          1.5 + rng.next() * 3,
+          color,
+          1.4,
+          0.35
+        );
+      }
+      this.spawn(x, y, 0, 0, 0.16, 14, "#ffffff", 0, 0);
+      this.spawn(x, y, 0, 0, 0.3, 9, color, 0, 0);
+    }
+    sparks(x, y, angle, color, rng, count = 6) {
+      for (let i = 0; i < count; i++) {
+        const a = angle + (rng.next() - 0.5) * 1.5;
+        const sp = 120 + rng.next() * 240;
+        this.spawn(x, y, Math.cos(a) * sp, Math.sin(a) * sp, 0.15 + rng.next() * 0.25, 1.4 + rng.next() * 1.6, color, 2.2, 0.1);
+      }
+    }
+    trail(x, y, vx, vy, color, size = 2.2) {
+      this.spawn(x, y, vx, vy, 0.28, size, color, 1.2, 0);
+    }
+    ringBurst(x, y, color, rng, count = 36, power = 380) {
+      for (let i = 0; i < count; i++) {
+        const a = i / count * TAU + rng.next() * 0.1;
+        this.spawn(x, y, Math.cos(a) * power, Math.sin(a) * power, 0.6 + rng.next() * 0.5, 2 + rng.next() * 2.5, color, 1.1, 0.3);
+      }
+    }
+    update(dt, gravityAt2) {
+      const list = this.list;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const p = list[i];
+        p.life -= dt;
+        if (p.life <= 0) {
+          list.splice(i, 1);
+          continue;
+        }
+        if (p.gravity > 0) {
+          const g = gravityAt2(p.x, p.y);
+          p.vx += g.ax * p.gravity * dt;
+          p.vy += g.ay * p.gravity * dt;
+        }
+        const d = Math.max(0, 1 - p.drag * dt);
+        p.vx *= d;
+        p.vy *= d;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+    }
+    draw(ctx2) {
+      for (const p of this.list) {
+        const t = p.life / p.maxLife;
+        ctx2.globalAlpha = Math.min(1, t * 1.6);
+        ctx2.fillStyle = p.color;
+        if (p.glow) {
+          ctx2.shadowColor = p.color;
+          ctx2.shadowBlur = 8;
+        }
+        const s = p.size * (0.4 + 0.6 * t);
+        ctx2.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+      }
+      ctx2.globalAlpha = 1;
+      ctx2.shadowBlur = 0;
+    }
+  };
+
+  // orbitfall/game/js/upgrades.js
+  var UPGRADES = [
+    {
+      id: "rapid",
+      name: "Rapid Fire",
+      glyph: "RF",
+      color: "#37f4ff",
+      blurb: "Cannons cycle 16% faster.",
+      apply: (ship) => {
+        ship.stats.fireInterval *= 0.84;
+      }
+    },
+    {
+      id: "split",
+      name: "Split Shot",
+      glyph: "SS",
+      color: "#8ef6ff",
+      blurb: "+1 projectile in every volley.",
+      apply: (ship) => {
+        ship.stats.projectiles += 1;
+      }
+    },
+    {
+      id: "heavy",
+      name: "Heavy Rounds",
+      glyph: "HR",
+      color: "#ffc857",
+      blurb: "Shots deal +1 damage.",
+      apply: (ship) => {
+        ship.stats.damage += 1;
+      }
+    },
+    {
+      id: "aegis",
+      name: "Aegis Plating",
+      glyph: "AG",
+      color: "#3dff8e",
+      blurb: "+25 max hull and repair 25.",
+      apply: (ship) => {
+        ship.maxHp += 25;
+        ship.heal(25);
+      }
+    },
+    {
+      id: "ion",
+      name: "Ion Thrusters",
+      glyph: "IT",
+      color: "#6db3ff",
+      blurb: "Thrust power up 18%.",
+      apply: (ship) => {
+        ship.stats.thrust *= 1.18;
+      }
+    },
+    {
+      id: "magnet",
+      name: "Star Magnet",
+      glyph: "SM",
+      color: "#ffb3f2",
+      blurb: "Stardust is pulled from +65 px further out.",
+      apply: (ship) => {
+        ship.stats.magnet += 65;
+      }
+    },
+    {
+      id: "nova",
+      name: "Nova Pulse",
+      glyph: "NP",
+      color: "#ff3df0",
+      blurb: "A shockwave bursts from the ship every few seconds, searing nearby drones.",
+      apply: (ship) => {
+        ship.stats.novaLevel += 1;
+        if (ship.stats.novaLevel > 1) ship.stats.novaDamage += 2;
+        ship.stats.novaCooldown = Math.max(5, ship.stats.novaCooldown - 1.5);
+        ship.novaTimer = Math.min(ship.novaTimer, ship.stats.novaCooldown);
+      }
+    },
+    {
+      id: "hull",
+      name: "Reinforced Hull",
+      glyph: "RH",
+      color: "#ff8fa8",
+      blurb: "Shrug off 10% of all incoming damage.",
+      apply: (ship) => {
+        ship.stats.armor = Math.min(0.55, ship.stats.armor + 0.1);
+      }
+    },
+    {
+      id: "overcharge",
+      name: "Overcharge Core",
+      glyph: "OC",
+      color: "#ffe9a3",
+      blurb: "Shot speed +18% and combos hold 0.8 s longer.",
+      apply: (ship) => {
+        ship.stats.bulletSpeed *= 1.18;
+        ship.stats.comboWindow += 0.8;
+      }
+    }
+  ];
+  function draftChoices(rng) {
+    const pool = UPGRADES.slice();
+    const picks = [];
+    for (let i = 0; i < 3; i++) {
+      const idx = Math.floor(rng.next() * pool.length);
+      picks.push(pool.splice(idx, 1)[0]);
+    }
+    return picks;
+  }
+
+  // orbitfall/game/js/ui.js
+  var FONT = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
+  function roundRect(ctx2, x, y, w, h, r) {
+    ctx2.beginPath();
+    ctx2.moveTo(x + r, y);
+    ctx2.arcTo(x + w, y, x + w, y + h, r);
+    ctx2.arcTo(x + w, y + h, x, y + h, r);
+    ctx2.arcTo(x, y + h, x, y, r);
+    ctx2.arcTo(x, y, x + w, y, r);
+    ctx2.closePath();
+  }
+  function text(ctx2, str, x, y, size, color, align = "left", weight = 700, alpha = 1) {
+    ctx2.globalAlpha = alpha;
+    ctx2.font = `${weight} ${size}px ${FONT}`;
+    ctx2.textAlign = align;
+    ctx2.textBaseline = "middle";
+    ctx2.fillStyle = color;
+    ctx2.fillText(str, x, y);
+    ctx2.globalAlpha = 1;
+  }
+  function glowText(ctx2, str, x, y, size, color, align = "center") {
+    ctx2.save();
+    ctx2.shadowColor = color;
+    ctx2.shadowBlur = 18;
+    text(ctx2, str, x, y, size, color, align, 800);
+    ctx2.restore();
+  }
+  function bar(ctx2, x, y, w, h, frac, color, back = "rgba(255,255,255,0.14)") {
+    ctx2.fillStyle = back;
+    roundRect(ctx2, x, y, w, h, h / 2);
+    ctx2.fill();
+    if (frac > 0) {
+      ctx2.fillStyle = color;
+      roundRect(ctx2, x, y, Math.max(h, w * Math.min(1, frac)), h, h / 2);
+      ctx2.fill();
+    }
+  }
+  function drawHUD(ctx2, G) {
+    const ship = G.player;
+    text(ctx2, "SCORE", 26, 30, 13, "#7fd8e8", "left", 700, 0.9);
+    text(ctx2, String(G.score).padStart(7, "0"), 26, 56, 30, "#eafcff", "left", 800);
+    if (G.combo > 1) {
+      const mult = (1 + Math.min(G.combo, 20) * 0.1).toFixed(1);
+      text(ctx2, `COMBO x${mult}`, 26, 88, 16, "#ffc857", "left", 800);
+      bar(ctx2, 26, 102, 120, 5, G.comboTimer / ship.stats.comboWindow, "#ffc857");
+    }
+    text(ctx2, `WAVE ${G.wave}`, VIEW_W / 2, 38, 24, "#eafcff", "center", 800);
+    if (G.enemiesLeftToSpawn > 0 || G.enemies.length > 0) {
+      text(ctx2, `${G.enemies.length + G.enemiesLeftToSpawn} HOSTILES`, VIEW_W / 2, 64, 12, "#ff8fa8", "center", 700, 0.85);
+    }
+    ctx2.fillStyle = "#8ef6ff";
+    ctx2.shadowColor = "#8ef6ff";
+    ctx2.shadowBlur = 10;
+    ctx2.beginPath();
+    ctx2.arc(VIEW_W - 118, 36, 6, 0, Math.PI * 2);
+    ctx2.fill();
+    ctx2.shadowBlur = 0;
+    text(ctx2, String(G.dust), VIEW_W - 100, 37, 24, "#eafcff", "left", 800);
+    text(ctx2, "STARDUST", VIEW_W - 26, 60, 11, "#7fd8e8", "right", 700, 0.9);
+    text(ctx2, "HULL", 26, VIEW_H - 52, 12, "#7fd8e8", "left", 700, 0.9);
+    const hpFrac = ship.hp / ship.maxHp;
+    bar(ctx2, 26, VIEW_H - 40, 240, 13, hpFrac, hpFrac > 0.3 ? "#3dff8e" : "#ff4d6d");
+    text(ctx2, `${Math.ceil(ship.hp)} / ${ship.maxHp}`, 276, VIEW_H - 33, 14, "#eafcff", "left", 700);
+    if (ship.stats.novaLevel > 0) {
+      const ready = ship.novaTimer <= 0.05;
+      text(ctx2, ready ? "NOVA READY" : "NOVA", 26, VIEW_H - 14, 11, ready ? "#ff3df0" : "#7f7fa8", "left", 700, 0.9);
+      if (!ready) bar(ctx2, 70, VIEW_H - 19, 90, 5, 1 - ship.novaTimer / ship.stats.novaCooldown, "#ff3df0");
+    }
+    if (G.boss && !G.boss.dead) {
+      text(ctx2, "SENTINEL", VIEW_W / 2, 92, 13, "#ff3df0", "center", 800);
+      bar(ctx2, VIEW_W / 2 - 190, 104, 380, 9, G.boss.hp / G.boss.maxHp, "#ff3df0");
+    }
+    if (G.muted) text(ctx2, "MUTED (M)", VIEW_W - 26, VIEW_H - 20, 12, "#7f7fa8", "right", 700, 0.8);
+  }
+  function drawTitleScreen(ctx2, G, t) {
+    ctx2.fillStyle = "rgba(3, 6, 18, 0.45)";
+    ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+    const pulse = 0.85 + 0.15 * Math.sin(t * 2);
+    ctx2.save();
+    ctx2.globalAlpha = pulse;
+    glowText(ctx2, "ORBITFALL", VIEW_W / 2, 218, 92, "#37f4ff");
+    ctx2.restore();
+    text(ctx2, "Hold the orbit. Outlive the collapse.", VIEW_W / 2, 282, 22, "#ffe9a3", "center", 600);
+    const lines = [
+      "The star is dying, and its gravity bends everything \u2014 your ship, the swarm, even your own shots.",
+      "Curve your fire around the star. Harvest stardust from the wreckage before the star eats it.",
+      "Draft a refit after every wave and see how long the last warden can last."
+    ];
+    lines.forEach((line, i) => text(ctx2, line, VIEW_W / 2, 348 + i * 28, 16, "#b9d9ea", "center", 500, 0.92));
+    const controls = [
+      ["WASD / ARROWS", "thrust"],
+      ["MOUSE", "aim"],
+      ["HOLD CLICK / SPACE", "fire"],
+      ["P", "pause"],
+      ["M", "mute"]
+    ];
+    controls.forEach(([key, what], i) => {
+      const x = VIEW_W / 2 - 264 + i * 132;
+      text(ctx2, key, x, 486, 13, "#37f4ff", "center", 800);
+      text(ctx2, what, x, 508, 12, "#7f9fb8", "center", 500);
+    });
+    const blink = Math.sin(t * 3.2) > -0.2;
+    if (blink) glowText(ctx2, "CLICK OR PRESS ENTER TO FLY", VIEW_W / 2, 592, 24, "#3dff8e");
+    if (G.best > 0) text(ctx2, `BEST ${G.best}`, VIEW_W / 2, 648, 15, "#ffc857", "center", 700, 0.9);
+  }
+  function drawDraftScreen(ctx2, G, t) {
+    ctx2.fillStyle = "rgba(3, 6, 18, 0.62)";
+    ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+    glowText(ctx2, `WAVE ${G.wave} CLEARED`, VIEW_W / 2, 148, 40, "#3dff8e");
+    text(ctx2, "Choose a refit \u2014 click a card or press 1 / 2 / 3", VIEW_W / 2, 192, 17, "#b9d9ea", "center", 500);
+    const cardW = 252;
+    const cardH = 308;
+    const gap = 28;
+    const startX = (VIEW_W - (cardW * 3 + gap * 2)) / 2;
+    const y = 248;
+    G.cardRects = [];
+    G.choices.forEach((up, i) => {
+      const x = startX + i * (cardW + gap);
+      G.cardRects.push({ x, y, w: cardW, h: cardH, index: i });
+      const hover = G.mouse.x >= x && G.mouse.x <= x + cardW && G.mouse.y >= y && G.mouse.y <= y + cardH;
+      const lift = hover ? -8 : 0;
+      ctx2.save();
+      ctx2.translate(0, lift);
+      ctx2.fillStyle = hover ? "rgba(16, 34, 58, 0.96)" : "rgba(10, 20, 38, 0.94)";
+      ctx2.strokeStyle = up.color;
+      ctx2.lineWidth = hover ? 3 : 2;
+      ctx2.shadowColor = up.color;
+      ctx2.shadowBlur = hover ? 22 : 10;
+      roundRect(ctx2, x, y, cardW, cardH, 14);
+      ctx2.fill();
+      ctx2.stroke();
+      ctx2.shadowBlur = 0;
+      ctx2.beginPath();
+      ctx2.arc(x + cardW / 2, y + 78, 40, 0, Math.PI * 2);
+      ctx2.fillStyle = "rgba(255,255,255,0.06)";
+      ctx2.fill();
+      ctx2.strokeStyle = up.color;
+      ctx2.lineWidth = 2;
+      ctx2.stroke();
+      text(ctx2, up.glyph, x + cardW / 2, y + 79, 30, up.color, "center", 800);
+      text(ctx2, up.name, x + cardW / 2, y + 152, 23, "#eafcff", "center", 800);
+      const words = up.blurb.split(" ");
+      const lines = [""];
+      for (const w of words) {
+        const trial = lines[lines.length - 1] ? `${lines[lines.length - 1]} ${w}` : w;
+        if (trial.length > 24 && lines[lines.length - 1]) lines.push(w);
+        else lines[lines.length - 1] = trial;
+      }
+      lines.slice(0, 3).forEach((line, li) => text(ctx2, line, x + cardW / 2, y + 192 + li * 22, 14.5, "#b9d9ea", "center", 500));
+      text(ctx2, `[ ${i + 1} ]`, x + cardW / 2, y + cardH - 28, 15, "#7f9fb8", "center", 700);
+      ctx2.restore();
+    });
+    text(ctx2, `Stardust banked: ${G.dust}`, VIEW_W / 2, y + cardH + 42, 15, "#8ef6ff", "center", 700, 0.9);
+  }
+  function drawPauseScreen(ctx2) {
+    ctx2.fillStyle = "rgba(3, 6, 18, 0.6)";
+    ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+    glowText(ctx2, "PAUSED", VIEW_W / 2, VIEW_H / 2 - 20, 52, "#37f4ff");
+    text(ctx2, "Press P or Esc to resume", VIEW_W / 2, VIEW_H / 2 + 34, 17, "#b9d9ea", "center", 500);
+  }
+  function drawGameOverScreen(ctx2, G, t) {
+    ctx2.fillStyle = "rgba(10, 3, 10, 0.55)";
+    ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+    glowText(ctx2, "THE STAR CLAIMS ANOTHER", VIEW_W / 2, 232, 46, "#ff4d6d");
+    text(ctx2, "Your orbit decayed. The swarm drifts on without its warden.", VIEW_W / 2, 282, 17, "#b9d9ea", "center", 500);
+    const rows = [
+      ["FINAL SCORE", G.score],
+      ["WAVES SURVIVED", G.wave],
+      ["DRONES DOWN", G.kills],
+      ["STARDUST HARVESTED", G.dustTotal],
+      ["BEST SCORE", G.best]
+    ];
+    rows.forEach(([label, value], i) => {
+      const y = 356 + i * 40;
+      text(ctx2, label, VIEW_W / 2 - 24, y, 15, "#7fd8e8", "right", 700);
+      text(ctx2, String(value), VIEW_W / 2 + 24, y, 22, "#eafcff", "left", 800);
+    });
+    const blink = Math.sin(t * 3.2) > -0.2;
+    if (blink) glowText(ctx2, "PRESS R OR CLICK TO FLY AGAIN", VIEW_W / 2, 620, 22, "#3dff8e");
+  }
+
+  // orbitfall/game/js/game.js
+  var BEST_KEY = "orbitfall-best";
+  var Game = class {
+    constructor({ shot: shot2 = null, seed: seed2 = 7, synth: synth2 = null } = {}) {
+      this.shot = shot2;
+      this.seed = seed2;
+      this.rng = makeRng(seed2 ^ 2654435769);
+      this.synth = synth2;
+      this.bg = new Starfield();
+      this.player = new Ship();
+      this.shots = new ProjectileField();
+      this.particles = new Particles();
+      this.dustField = new DustField();
+      this.enemies = [];
+      this.boss = null;
+      this.state = "title";
+      this.time = 0;
+      this.mouse = { x: VIEW_W / 2, y: 210, down: false };
+      this.keys = /* @__PURE__ */ new Set();
+      this.choices = [];
+      this.cardRects = [];
+      this.shake = 0;
+      this.flash = 0;
+      this.spawnQueue = [];
+      this.spawnTimer = 0;
+      this.spawnInterval = 0.85;
+      this.openingBoost = 0;
+      this.enemiesLeftToSpawn = 0;
+      this.hpScale = 1;
+      this.novaFx = null;
+      this.muted = false;
+      this.shotFxTimer = 0;
+      this.shotBursts = null;
+      this.lastPickupSound = 0;
+      this.best = this.loadBest();
+      this.resetRunStats();
+      if (this.shot) this.setupShotScene(this.shot);
+    }
+    loadBest() {
+      try {
+        return Number(localStorage.getItem(BEST_KEY)) || 0;
+      } catch {
+        return 0;
+      }
+    }
+    saveBest() {
+      try {
+        localStorage.setItem(BEST_KEY, String(this.best));
+      } catch {
+      }
+    }
+    resetRunStats() {
+      this.score = 0;
+      this.combo = 0;
+      this.comboTimer = 0;
+      this.wave = 0;
+      this.kills = 0;
+      this.dust = 0;
+      this.dustTotal = 0;
+    }
+    // --- Run / wave flow -------------------------------------------------------
+    startRun() {
+      this.player.reset(340);
+      this.enemies = [];
+      this.boss = null;
+      this.shots.clear();
+      this.particles.clear();
+      this.dustField.clear();
+      this.spawnQueue = [];
+      this.novaFx = null;
+      this.resetRunStats();
+      this.state = "playing";
+      this.nextWave();
+    }
+    nextWave() {
+      this.wave += 1;
+      this.hpScale = 1 + (this.wave - 1) * 0.12;
+      const isBossWave = this.wave % 5 === 0;
+      let budget = 6 + this.wave * 3;
+      if (isBossWave) {
+        const boss = new Enemy("sentinel", this.rng.angle(), this.rng, 1 + (this.wave / 5 - 1) * 0.8);
+        this.enemies.push(boss);
+        this.boss = boss;
+        if (this.synth) this.synth.bossWarn();
+        budget = Math.floor(budget / 2);
+      }
+      const table = [["drifter", 1]];
+      if (this.wave >= 2) table.push(["weaver", 2]);
+      if (this.wave >= 3) table.push(["splitter", 2]);
+      if (this.wave >= 4) table.push(["sniper", 3]);
+      this.spawnQueue = [];
+      let guard = 0;
+      while (budget > 0 && guard++ < 200) {
+        const [type, cost] = this.rng.pick(table);
+        if (cost > budget && this.spawnQueue.length > 0) break;
+        if (cost > budget) continue;
+        this.spawnQueue.push(type);
+        budget -= cost;
+      }
+      for (let i = this.spawnQueue.length - 1; i > 0; i--) {
+        const j = Math.floor(this.rng.next() * (i + 1));
+        [this.spawnQueue[i], this.spawnQueue[j]] = [this.spawnQueue[j], this.spawnQueue[i]];
+      }
+      this.enemiesLeftToSpawn = this.spawnQueue.length;
+      this.spawnInterval = this.wave === 1 ? 0.6 : 0.85;
+      this.spawnTimer = this.wave === 1 ? 0.9 : 1.1;
+      this.openingBoost = this.wave === 1 ? 3 : 0;
+    }
+    waveCleared() {
+      this.score += 100 * this.wave;
+      this.choices = draftChoices(this.rng);
+      this.state = "draft";
+      if (this.synth) this.synth.draftOpen();
+    }
+    pickDraft(index) {
+      const up = this.choices[index];
+      if (!up) return;
+      up.apply(this.player);
+      if (this.synth) this.synth.upgrade();
+      this.state = "playing";
+      this.nextWave();
+    }
+    gameOver() {
+      this.state = "gameover";
+      if (this.score > this.best) {
+        this.best = this.score;
+        this.saveBest();
+      }
+      this.particles.explosion(this.player.x, this.player.y, "#37f4ff", this.rng, 46, 380);
+      this.particles.ringBurst(this.player.x, this.player.y, "#ffc857", this.rng, 30, 320);
+      this.shake = 13;
+      if (this.synth) this.synth.explosion(true);
+    }
+    // --- Spawning helpers ------------------------------------------------------
+    spawnEnemy(type) {
+      const e = new Enemy(type, this.rng.angle(), this.rng, this.hpScale);
+      if (this.openingBoost > 0) {
+        this.openingBoost -= 1;
+        const a = Math.atan2(e.y - STAR.y, e.x - STAR.x);
+        e.x = STAR.x + Math.cos(a) * 505;
+        e.y = STAR.y + Math.sin(a) * 505;
+      }
+      this.enemies.push(e);
+      return e;
+    }
+    spawnMiniAt(x, y) {
+      const e = new Enemy("mini", 0, this.rng, this.hpScale);
+      const a = this.rng.angle();
+      e.x = x;
+      e.y = y;
+      e.vx = Math.cos(a) * 130;
+      e.vy = Math.sin(a) * 130;
+      this.enemies.push(e);
+      return e;
+    }
+    // --- Combat ----------------------------------------------------------------
+    fireVolley() {
+      const ship = this.player;
+      const stats = ship.stats;
+      const aim = Math.atan2(this.mouse.y - ship.y, this.mouse.x - ship.x);
+      const n = stats.projectiles;
+      const spreadStep = 0.085;
+      for (let i = 0; i < n; i++) {
+        const offset = (i - (n - 1) / 2) * spreadStep;
+        const a = aim + offset;
+        this.shots.fireBullet(
+          ship.x + Math.cos(ship.angle) * 18,
+          ship.y + Math.sin(ship.angle) * 18,
+          a,
+          stats.bulletSpeed,
+          stats.damage
+        );
+      }
+      this.particles.sparks(ship.x + Math.cos(aim) * 20, ship.y + Math.sin(aim) * 20, aim, "#aef7ff", this.rng, 2);
+      if (this.synth) this.synth.laser();
+      ship.markFired();
+    }
+    triggerNova() {
+      const ship = this.player;
+      ship.novaTimer = ship.stats.novaCooldown;
+      this.novaFx = { r: 12, max: 205, alpha: 1 };
+      for (const e of this.enemies) {
+        const d = Math.hypot(e.x - ship.x, e.y - ship.y);
+        if (d < 205 + e.radius) {
+          e.hp -= ship.stats.novaDamage;
+          e.flash = 0.1;
+          const ux = (e.x - ship.x) / (d || 1);
+          const uy = (e.y - ship.y) / (d || 1);
+          e.vx += ux * 260;
+          e.vy += uy * 260;
+          if (e.hp <= 0) this.killEnemy(e, true);
+        }
+      }
+      if (this.synth) this.synth.tone(160, 740, 0.28, "sine", 0.14);
+    }
+    killEnemy(e, giveScore = true) {
+      if (e.dead) return;
+      e.dead = true;
+      const isBoss = e.type === "sentinel";
+      this.particles.explosion(e.x, e.y, e.cfg.color, this.rng, isBoss ? 64 : 22, isBoss ? 430 : 260);
+      if (isBoss) {
+        this.particles.ringBurst(e.x, e.y, "#ff3df0", this.rng, 42, 400);
+        this.shake = Math.max(this.shake, 13);
+        this.boss = null;
+      }
+      this.dustField.drop(e.x, e.y, this.rng, e.cfg.dust);
+      if (giveScore) {
+        this.combo += 1;
+        this.comboTimer = this.player.stats.comboWindow;
+        const mult = 1 + Math.min(this.combo, 20) * 0.1;
+        this.score += Math.round(e.cfg.score * mult);
+        this.kills += 1;
+      }
+      if (this.synth) this.synth.explosion(isBoss);
+      if (e.type === "splitter") {
+        for (let i = 0; i < 3; i++) this.spawnMiniAt(e.x, e.y);
+      }
+    }
+    damagePlayer(amount) {
+      const dealt = this.player.hurt(amount);
+      if (dealt <= 0) return;
+      this.flash = 0.6;
+      this.shake = Math.max(this.shake, Math.min(11, 4 + amount * 0.25));
+      this.particles.sparks(this.player.x, this.player.y, this.rng.angle(), "#ff4d6d", this.rng, 10);
+      if (this.synth) this.synth.playerHit();
+      if (!this.player.alive) this.gameOver();
+    }
+    // --- Simulation ------------------------------------------------------------
+    update(dt) {
+      this.time += dt;
+      this.shake = Math.max(0, this.shake - dt * 26);
+      this.flash = Math.max(0, this.flash - dt * 1.7);
+      if (this.shot) {
+        this.updateShotAmbient(dt);
+        return;
+      }
+      if (this.state === "playing") this.updatePlaying(dt);
+      else if (this.state === "title") {
+        this.player.update(dt, {
+          thrustX: 0,
+          thrustY: 0,
+          aimX: this.player.x + this.player.vx,
+          aimY: this.player.y + this.player.vy
+        });
+        this.particles.update(dt, gravityAt);
+      } else {
+        this.particles.update(dt, gravityAt);
+      }
+    }
+    updatePlaying(dt) {
+      const ship = this.player;
+      let tx = 0;
+      let ty = 0;
+      if (this.keys.has("KeyA") || this.keys.has("ArrowLeft")) tx -= 1;
+      if (this.keys.has("KeyD") || this.keys.has("ArrowRight")) tx += 1;
+      if (this.keys.has("KeyW") || this.keys.has("ArrowUp")) ty -= 1;
+      if (this.keys.has("KeyS") || this.keys.has("ArrowDown")) ty += 1;
+      ship.update(dt, { thrustX: tx, thrustY: ty, aimX: this.mouse.x, aimY: this.mouse.y });
+      if (ship.thrusting && this.rng.chance(0.5)) {
+        this.particles.trail(
+          ship.x - Math.cos(ship.angle) * 14,
+          ship.y - Math.sin(ship.angle) * 14,
+          -ship.vx * 0.2,
+          -ship.vy * 0.2,
+          "rgba(110, 200, 255, 1)",
+          2
+        );
+      }
+      if ((this.mouse.down || this.keys.has("Space")) && ship.canFire()) this.fireVolley();
+      if (ship.stats.novaLevel > 0 && ship.alive) {
+        ship.novaTimer -= dt;
+        if (ship.novaTimer <= 0) this.triggerNova();
+      }
+      if (this.novaFx) {
+        this.novaFx.r += 560 * dt;
+        this.novaFx.alpha = Math.max(0, 1 - this.novaFx.r / this.novaFx.max);
+        if (this.novaFx.r >= this.novaFx.max) this.novaFx = null;
+      }
+      if (this.spawnQueue.length > 0) {
+        this.spawnTimer -= dt;
+        if (this.spawnTimer <= 0) {
+          this.spawnTimer = this.spawnInterval;
+          this.spawnEnemy(this.spawnQueue.pop());
+          this.enemiesLeftToSpawn = this.spawnQueue.length;
+        }
+      }
+      const env = {
+        player: ship,
+        time: this.time,
+        rng: this.rng,
+        shoot: (x, y, a) => this.shots.fireOrb(x, y, a, 195, 8),
+        spawnMini: (x, y) => this.spawnMiniAt(x, y)
+      };
+      for (const e of this.enemies) e.update(dt, env);
+      this.shots.update(dt);
+      this.particles.update(dt, gravityAt);
+      this.dustField.update(dt, ship, () => {
+        this.dust += 1;
+        this.dustTotal += 1;
+        this.score += 25;
+        if (this.synth && this.time - this.lastPickupSound > 0.09) {
+          this.lastPickupSound = this.time;
+          this.synth.pickup();
+        }
+      });
+      if (this.comboTimer > 0) {
+        this.comboTimer -= dt;
+        if (this.comboTimer <= 0) this.combo = 0;
+      }
+      this.collide();
+      if (this.enemies.some((e) => e.dead)) {
+        this.enemies = this.enemies.filter((e) => !e.dead);
+      }
+      if (ship.alive && distToStar(ship.x, ship.y) < STAR.surface + 6) {
+        const r = distToStar(ship.x, ship.y) || 1;
+        ship.vx += (ship.x - STAR.x) / r * 340;
+        ship.vy += (ship.y - STAR.y) / r * 340;
+        this.damagePlayer(24);
+      }
+      if (ship.alive && this.spawnQueue.length === 0 && this.enemies.length === 0 && this.state === "playing") {
+        this.waveCleared();
+      }
+    }
+    collide() {
+      const ship = this.player;
+      for (let bi = this.shots.bullets.length - 1; bi >= 0; bi--) {
+        const b = this.shots.bullets[bi];
+        let spent = false;
+        for (const e of this.enemies) {
+          if (e.dead) continue;
+          const d = Math.hypot(e.x - b.x, e.y - b.y);
+          if (d < e.radius + b.r) {
+            e.hp -= b.damage;
+            e.flash = 0.09;
+            this.particles.sparks(b.x, b.y, Math.atan2(b.vy, b.vx) + Math.PI, "#ffffff", this.rng, 4);
+            if (e.hp <= 0) this.killEnemy(e, true);
+            spent = true;
+            break;
+          }
+        }
+        if (spent) this.shots.bullets.splice(bi, 1);
+      }
+      if (ship.alive) {
+        for (let oi = this.shots.orbs.length - 1; oi >= 0; oi--) {
+          const o = this.shots.orbs[oi];
+          if (Math.hypot(o.x - ship.x, o.y - ship.y) < o.r + ship.radius) {
+            this.shots.orbs.splice(oi, 1);
+            this.damagePlayer(o.damage);
+            if (!ship.alive) break;
+          }
+        }
+      }
+      for (const e of this.enemies) {
+        if (e.dead) continue;
+        if (distToStar(e.x, e.y) < STAR.surface - 4) {
+          e.dead = true;
+          if (this.boss === e) this.boss = null;
+          this.particles.explosion(e.x, e.y, "#ff9a3d", this.rng, 10, 150);
+          continue;
+        }
+        if (ship.alive && Math.hypot(e.x - ship.x, e.y - ship.y) < e.radius + ship.radius - 2) {
+          if (e.type === "sentinel") {
+            e.hp -= 15;
+            e.flash = 0.09;
+            if (e.hp <= 0) this.killEnemy(e, true);
+          } else {
+            this.killEnemy(e, false);
+          }
+          this.damagePlayer(e.cfg.contact);
+        }
+      }
+    }
+    // --- Input -----------------------------------------------------------------
+    pressKey(code) {
+      this.keys.add(code);
+      if (code === "KeyM") {
+        if (this.synth) this.muted = this.synth.toggleMute();
+        return;
+      }
+      switch (this.state) {
+        case "title":
+          if (code === "Enter" || code === "Space") this.startRun();
+          break;
+        case "playing":
+          if (code === "KeyP" || code === "Escape") this.state = "paused";
+          break;
+        case "paused":
+          if (code === "KeyP" || code === "Escape") this.state = "playing";
+          break;
+        case "draft":
+          if (code === "Digit1") this.pickDraft(0);
+          if (code === "Digit2") this.pickDraft(1);
+          if (code === "Digit3") this.pickDraft(2);
+          break;
+        case "gameover":
+          if (code === "KeyR" || code === "Enter") this.startRun();
+          break;
+      }
+    }
+    releaseKey(code) {
+      this.keys.delete(code);
+    }
+    click(x, y) {
+      if (this.synth) this.synth.unlock();
+      switch (this.state) {
+        case "title":
+          this.startRun();
+          break;
+        case "gameover":
+          this.startRun();
+          break;
+        case "draft": {
+          for (const r of this.cardRects) {
+            if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+              this.pickDraft(r.index);
+              break;
+            }
+          }
+          break;
+        }
+      }
+    }
+    // --- Screenshot scenes -------------------------------------------------------
+    // Frozen tableaux of real game states, built from the seeded stream so the
+    // screenshots are honest renders of the game's own code. Gameplay stays
+    // frozen; only ambient life (star, starfield, particles) keeps moving.
+    placeEnemy(type, angle, radius, hpFrac = 1) {
+      const e = new Enemy(type, 0, this.rng, 1);
+      e.x = STAR.x + Math.cos(angle) * radius;
+      e.y = STAR.y + Math.sin(angle) * radius;
+      const dir = 1;
+      e.vx = -Math.sin(angle) * 90 * dir;
+      e.vy = Math.cos(angle) * 90 * dir;
+      e.hp = Math.max(1, Math.round(e.maxHp * hpFrac));
+      e.aimX = this.player.x;
+      e.aimY = this.player.y;
+      this.enemies.push(e);
+      return e;
+    }
+    placePlayer(angle, radius) {
+      const p = this.player;
+      p.x = STAR.x + Math.cos(angle) * radius;
+      p.y = STAR.y + Math.sin(angle) * radius;
+      p.vx = -Math.sin(angle) * 150;
+      p.vy = Math.cos(angle) * 150;
+      p.angle = angle + Math.PI * 0.62;
+      this.mouse.x = p.x + Math.cos(p.angle) * 220;
+      this.mouse.y = p.y + Math.sin(p.angle) * 220;
+      return p;
+    }
+    setupShotScene(name) {
+      const rng = this.rng;
+      if (name === "title") {
+        this.state = "title";
+        this.placePlayer(-2.25, 335);
+        this.placeEnemy("drifter", 0.7, 520);
+        this.placeEnemy("drifter", 2.6, 580);
+        this.placeEnemy("weaver", -0.5, 555);
+        this.best = 12480;
+      } else if (name === "action") {
+        this.state = "playing";
+        this.wave = 3;
+        this.score = 8640;
+        this.combo = 6;
+        this.comboTimer = 1.9;
+        this.dust = 23;
+        this.dustTotal = 23;
+        const p = this.placePlayer(2.75, 345);
+        p.hp = 62;
+        const aim = Math.atan2(225 - p.y, STAR.x - p.x);
+        p.angle = aim;
+        this.mouse.x = p.x + Math.cos(aim) * 260;
+        this.mouse.y = p.y + Math.sin(aim) * 260;
+        const plan = [
+          ["drifter", 1.9, 300],
+          ["drifter", 3.4, 380],
+          ["drifter", 0.4, 430],
+          ["drifter", 5.6, 350],
+          ["weaver", 2.9, 470],
+          ["weaver", 4.6, 300],
+          ["weaver", 0.9, 420],
+          ["splitter", 1.35, 330],
+          ["splitter", 5.3, 380],
+          ["sniper", 3.9, 500],
+          ["sniper", 0.05, 260],
+          ["mini", 1.75, 330],
+          ["mini", 2.05, 300],
+          ["mini", 1.55, 260]
+        ];
+        for (const [type, a, r] of plan) this.placeEnemy(type, a, r, 0.8);
+        this.enemiesLeftToSpawn = 0;
+        const snipers = this.enemies.filter((e) => e.type === "sniper");
+        const fireOrbAtPlayer = (s) => this.shots.fireOrb(s.x, s.y, Math.atan2(p.y - s.y, p.x - s.x), 195, 8);
+        fireOrbAtPlayer(snipers[0]);
+        for (let s = 0; s < 22; s++) {
+          if (s % 3 === 0) {
+            for (const off of [-0.085, 0, 0.085]) {
+              this.shots.fireBullet(
+                p.x + Math.cos(aim + off) * 18,
+                p.y + Math.sin(aim + off) * 18,
+                aim + off,
+                p.stats.bulletSpeed,
+                1
+              );
+            }
+          }
+          if (s === 8) fireOrbAtPlayer(snipers[1]);
+          if (s === 14) fireOrbAtPlayer(snipers[0]);
+          this.shots.update(0.05);
+        }
+        this.shotBursts = [
+          { x: STAR.x + 190, y: STAR.y - 100, color: "#ff4d6d" },
+          { x: STAR.x + 370, y: STAR.y + 70, color: "#ffb02e" }
+        ];
+        for (const b of this.shotBursts) {
+          this.particles.explosion(b.x, b.y, b.color, rng, 30, 300);
+          this.particles.ringBurst(b.x, b.y, b.color, rng, 26, 300);
+        }
+        this.dustField.drop(STAR.x + 190, STAR.y - 240, rng, 5);
+        this.dustField.drop(STAR.x - 250, STAR.y + 215, rng, 4);
+        this.dustField.drop(STAR.x + 360, STAR.y - 100, rng, 4);
+      } else if (name === "upgrade") {
+        this.state = "draft";
+        this.wave = 2;
+        this.score = 3120;
+        this.dust = 17;
+        this.placePlayer(2.2, 350);
+        this.placeEnemy("drifter", 0.9, 420);
+        this.placeEnemy("weaver", 4.2, 460);
+        this.placeEnemy("splitter", 5.5, 500);
+        this.dustField.drop(STAR.x + 260, STAR.y + 180, rng, 4);
+        this.choices = draftChoices(rng);
+      } else if (name === "end") {
+        this.state = "gameover";
+        this.score = 18420;
+        this.wave = 7;
+        this.kills = 132;
+        this.dust = 31;
+        this.dustTotal = 96;
+        this.best = 18420;
+        this.player.alive = false;
+        this.placeEnemy("drifter", 1.4, 430);
+        this.placeEnemy("sniper", 3.3, 480);
+        this.placeEnemy("weaver", 5.8, 390);
+        this.dustField.drop(STAR.x - 210, STAR.y - 160, rng, 6);
+        this.dustField.drop(STAR.x + 300, STAR.y + 210, rng, 5);
+      }
+    }
+    updateShotAmbient(dt) {
+      this.particles.update(dt, gravityAt);
+      if (this.shot === "action" && this.shotBursts) {
+        this.shotFxTimer -= dt;
+        if (this.shotFxTimer <= 0) {
+          this.shotFxTimer = 0.8;
+          for (const b of this.shotBursts) {
+            this.particles.explosion(b.x, b.y, b.color, this.rng, 18, 230);
+            this.particles.ringBurst(b.x, b.y, b.color, this.rng, 22, 260);
+          }
+        }
+      }
+    }
+    // --- Rendering ---------------------------------------------------------------
+    render(ctx2) {
+      const sx = this.shake > 0 ? (Math.random() * 2 - 1) * this.shake : 0;
+      const sy = this.shake > 0 ? (Math.random() * 2 - 1) * this.shake : 0;
+      this.bg.draw(ctx2, this.time, this.player.x, this.player.y);
+      ctx2.save();
+      ctx2.translate(sx, sy);
+      drawStar(ctx2, this.time);
+      this.dustField.draw(ctx2, this.time);
+      if (this.novaFx) {
+        ctx2.strokeStyle = `rgba(255, 61, 240, ${0.75 * this.novaFx.alpha})`;
+        ctx2.lineWidth = 5;
+        ctx2.shadowColor = "#ff3df0";
+        ctx2.shadowBlur = 16;
+        ctx2.beginPath();
+        ctx2.arc(this.player.x, this.player.y, this.novaFx.r, 0, TAU);
+        ctx2.stroke();
+        ctx2.shadowBlur = 0;
+      }
+      this.shots.draw(ctx2);
+      for (const e of this.enemies) e.draw(ctx2, this.time);
+      this.player.draw(ctx2, this.time);
+      this.particles.draw(ctx2);
+      ctx2.restore();
+      if (this.flash > 0) {
+        const v = ctx2.createRadialGradient(VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.36, VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.78);
+        v.addColorStop(0, "rgba(255, 30, 60, 0)");
+        v.addColorStop(1, `rgba(255, 30, 60, ${0.5 * this.flash})`);
+        ctx2.fillStyle = v;
+        ctx2.fillRect(0, 0, VIEW_W, VIEW_H);
+      }
+      switch (this.state) {
+        case "title":
+          drawTitleScreen(ctx2, this, this.time);
+          break;
+        case "playing":
+          drawHUD(ctx2, this);
+          break;
+        case "draft":
+          drawHUD(ctx2, this);
+          drawDraftScreen(ctx2, this, this.time);
+          break;
+        case "paused":
+          drawHUD(ctx2, this);
+          drawPauseScreen(ctx2);
+          break;
+        case "gameover":
+          drawGameOverScreen(ctx2, this, this.time);
+          break;
+      }
+    }
+  };
+
+  // orbitfall/game/js/audio.js
+  var Synth = class {
+    constructor(enabled) {
+      this.enabled = enabled;
+      this.ctx = null;
+      this.master = null;
+      this.muted = false;
+      this.noiseBuffer = null;
+      this.lastLaser = 0;
+    }
+    // Call from a user gesture (click / keydown) so the browser lets us play.
+    unlock() {
+      if (!this.enabled || this.ctx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.35;
+      this.master.connect(this.ctx.destination);
+      const len = this.ctx.sampleRate * 0.5;
+      this.noiseBuffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const data = this.noiseBuffer.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    }
+    toggleMute() {
+      this.muted = !this.muted;
+      if (this.master) this.master.gain.value = this.muted ? 0 : 0.35;
+      return this.muted;
+    }
+    tone(freqA, freqB, dur, type, vol, when = 0) {
+      if (!this.ctx || this.muted) return;
+      const t0 = this.ctx.currentTime + when;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freqA, t0);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, freqB), t0 + dur);
+      gain.gain.setValueAtTime(vol, t0);
+      gain.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+      osc.connect(gain).connect(this.master);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    }
+    noise(dur, vol, freq, q = 1) {
+      if (!this.ctx || this.muted) return;
+      const t0 = this.ctx.currentTime;
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+      const filter = this.ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(freq, t0);
+      filter.frequency.exponentialRampToValueAtTime(Math.max(40, freq * 0.2), t0 + dur);
+      filter.Q.value = q;
+      const gain = this.ctx.createGain();
+      gain.gain.setValueAtTime(vol, t0);
+      gain.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+      src.connect(filter).connect(gain).connect(this.master);
+      src.start(t0);
+      src.stop(t0 + dur + 0.02);
+    }
+    laser() {
+      if (!this.ctx || this.muted) return;
+      const now = performance.now();
+      if (now - this.lastLaser < 45) return;
+      this.lastLaser = now;
+      this.tone(920, 240, 0.09, "square", 0.1);
+    }
+    explosion(big = false) {
+      this.noise(big ? 0.7 : 0.35, big ? 0.5 : 0.28, big ? 900 : 1400);
+      this.tone(big ? 160 : 220, 40, big ? 0.6 : 0.3, "triangle", 0.25);
+    }
+    pickup() {
+      this.tone(660, 990, 0.08, "sine", 0.12);
+      this.tone(990, 1320, 0.1, "sine", 0.08, 0.05);
+    }
+    upgrade() {
+      this.tone(523, 523, 0.1, "triangle", 0.16);
+      this.tone(659, 659, 0.1, "triangle", 0.16, 0.09);
+      this.tone(784, 784, 0.16, "triangle", 0.18, 0.18);
+    }
+    playerHit() {
+      this.noise(0.25, 0.4, 2e3);
+      this.tone(300, 70, 0.3, "sawtooth", 0.22);
+    }
+    bossWarn() {
+      this.tone(196, 196, 0.22, "sawtooth", 0.2);
+      this.tone(196, 196, 0.22, "sawtooth", 0.2, 0.3);
+      this.tone(262, 262, 0.34, "sawtooth", 0.2, 0.6);
+    }
+    draftOpen() {
+      this.tone(440, 880, 0.18, "sine", 0.12);
+    }
+  };
+
+  // orbitfall/game/js/main.js
+  var canvas = document.getElementById("stage");
+  var ctx = canvas.getContext("2d");
+  canvas.width = VIEW_W;
+  canvas.height = VIEW_H;
+  var params = new URLSearchParams(window.location.search);
+  var shot = params.get("shot");
+  var seed = Number(params.get("seed")) || 7;
+  var synth = new Synth(!shot);
+  var game = new Game({ shot, seed, synth });
+  window.__orbitfall = game;
+  function fitCanvas() {
+    const scale = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H);
+    canvas.style.width = `${Math.floor(VIEW_W * scale)}px`;
+    canvas.style.height = `${Math.floor(VIEW_H * scale)}px`;
+  }
+  window.addEventListener("resize", fitCanvas);
+  fitCanvas();
+  function toGameCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) / rect.width * VIEW_W,
+      y: (clientY - rect.top) / rect.height * VIEW_H
+    };
+  }
+  window.addEventListener("keydown", (e) => {
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+    synth.unlock();
+    if (!e.repeat) game.pressKey(e.code);
+    else game.keys.add(e.code);
+  });
+  window.addEventListener("keyup", (e) => game.releaseKey(e.code));
+  window.addEventListener("blur", () => {
+    game.keys.clear();
+    game.mouse.down = false;
+    if (game.state === "playing" && !game.shot) game.state = "paused";
+  });
+  canvas.addEventListener("mousemove", (e) => {
+    const p = toGameCoords(e.clientX, e.clientY);
+    game.mouse.x = p.x;
+    game.mouse.y = p.y;
+  });
+  canvas.addEventListener("mousedown", (e) => {
+    const p = toGameCoords(e.clientX, e.clientY);
+    game.mouse.x = p.x;
+    game.mouse.y = p.y;
+    game.mouse.down = true;
+    game.click(p.x, p.y);
+  });
+  window.addEventListener("mouseup", () => {
+    game.mouse.down = false;
+  });
+  var last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1e3;
+    last = now;
+    if (dt > 0.05) dt = 0.05;
+    game.update(dt);
+    game.render(ctx);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
